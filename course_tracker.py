@@ -108,7 +108,7 @@ DATA_FILE = os.path.join(data_dir(), "data.json")
 
 def default_state():
     return {"v": 1, "days": {}, "activity": [], "theme": "vscode",
-            "font": 11, "last_day": 1}
+            "font": 11, "last_day": 1, "notes": []}
 
 
 def load_state():
@@ -310,7 +310,7 @@ class FastScroll(tk.Frame):
         self.cv.yview_moveto(0)
 
 
-NAV = [("Dashboard", "\u2302"), ("Today", "\u25b6"), ("Search", "\u2315"),
+NAV = [("Dashboard", "\u2302"), ("Today", "\u25b6"), ("Notes", "\u270e"), ("Search", "\u2315"),
        ("Timer", "\u25f7"), ("Import", "\u2193"), ("Settings", "\u2699")]
 
 
@@ -348,6 +348,9 @@ class App(ctk.CTk):
         self.loaded = set()
         self.shown = None
         self.dash_dirty = True
+        self.cur_note = None
+        self.big_mode = "day"
+        self.note_rows = {}
         self.panel_week = None
         self.panel_rows = {}
         self.week_w = {}
@@ -374,6 +377,7 @@ class App(ctk.CTk):
         self.pages = {}
         self.build_dashboard()
         self.build_day()
+        self.build_notes()
         self.build_search()
         self.build_timer()
         self.build_import()
@@ -458,6 +462,10 @@ class App(ctk.CTk):
         self.style_nav("Today" if name == "Day" else name)
         if name == "Dashboard" and self.dash_dirty:
             self.refresh_dashboard()
+        if name == "Notes":
+            self.refresh_note_list()
+            if self.cur_note is None and self.state_.get("notes"):
+                self.select_note(self.state_["notes"][0]["id"])
         if name == "Day":
             self.update_day_widgets()
 
@@ -714,11 +722,13 @@ class App(ctk.CTk):
         self.big_title = tl(head, "", 13, ACC, True, PANEL)
         self.big_title.pack(side="left")
         dark_button(head, "Close  \u2715", self.close_big, width=92, height=30).pack(side="right")
-        ctk.CTkCheckBox(head, text="Block complete", variable=self.blk_var, command=self.toggle_block,
-                        fg_color=ACC, hover_color=ACC_HI, border_color=ACC_DIM, checkmark_color="#000000",
-                        text_color=TEXT, corner_radius=5, border_width=2, checkbox_width=20,
-                        checkbox_height=20).pack(side="right", padx=14)
-        dark_button(head, "Copy", self.copy_big, width=64, height=30).pack(side="right")
+        self.big_check = ctk.CTkCheckBox(head, text="Block complete", variable=self.blk_var, command=self.toggle_block,
+                                         fg_color=ACC, hover_color=ACC_HI, border_color=ACC_DIM,
+                                         checkmark_color="#000000", text_color=TEXT, corner_radius=5,
+                                         border_width=2, checkbox_width=20, checkbox_height=20)
+        self.big_check.pack(side="right", padx=14)
+        self.big_copy = dark_button(head, "Copy", self.copy_big, width=64, height=30)
+        self.big_copy.pack(side="right")
         host = tk.Frame(ov, bg=EDBG)
         host.pack(fill="both", expand=True, padx=14, pady=(2, 14))
         ed = tk.Text(host, bg=EDBG, fg=TEXT, insertbackground=ACC, relief="flat", font=self.ef, undo=True,
@@ -730,20 +740,34 @@ class App(ctk.CTk):
         ys.pack(side="right", fill="y")
         xs.pack(side="bottom", fill="x")
         ed.pack(fill="both", expand=True)
-        self.setup_editor(ed, lambda: self.cur_block)
+        self.setup_editor(ed, lambda: "__note__" if self.big_mode == "note" else self.cur_block)
         self.big_ed = ed
         self.bind("<Escape>", lambda e: self.close_big())
 
-    def open_big(self):
-        if self.cur is None or self.big_open:
+    def open_big(self, mode="day"):
+        if self.big_open:
             return
-        key = self.cur_block
-        label_ = {k: lab for k, lab, _ in BLOCKS}[key]
-        self.big_title.configure(text=f"Day {self.cur}  \u00b7  {label_} notes")
+        if mode == "day" and self.cur is None:
+            return
+        if mode == "note" and self.cur_note is None:
+            return
+        self.big_mode = mode
+        if mode == "note":
+            n = self.note_by_id(self.cur_note)
+            self.big_title.configure(text=f"Note  \u00b7  {n['title']}")
+            text = n["text"]
+            self.big_check.pack_forget()
+        else:
+            key = self.cur_block
+            label_ = {k: lab for k, lab, _ in BLOCKS}[key]
+            self.big_title.configure(text=f"Day {self.cur}  \u00b7  {label_} notes")
+            text = self.state_["days"][str(self.cur)]["notes"].get(key, "")
+            if not self.big_check.winfo_ismapped():
+                self.big_check.pack(side="right", padx=14, before=self.big_copy)
         ed = self.big_ed
         self.loading = True
         ed.delete("1.0", "end")
-        ed.insert("1.0", self.state_["days"][str(self.cur)]["notes"].get(key, ""))
+        ed.insert("1.0", text)
         ed.edit_reset()
         ed.edit_modified(False)
         self.highlight(ed)
@@ -761,17 +785,26 @@ class App(ctk.CTk):
             return
         self.big.place_forget()
         self.big_open = False
+        if self.big_mode == "note":
+            n = self.note_by_id(self.cur_note) if self.cur_note is not None else None
+            if n is not None:
+                self.set_editor_text(self.note_ed, n["text"])
+                self.note_ed.focus_set()
+            return
         if self.cur is not None:
             key = self.cur_block
             ed = self.editors[key][1]
-            self.loading = True
-            ed.delete("1.0", "end")
-            ed.insert("1.0", self.state_["days"][str(self.cur)]["notes"].get(key, ""))
-            ed.edit_reset()
-            ed.edit_modified(False)
-            self.highlight(ed)
-            self.loading = False
+            self.set_editor_text(ed, self.state_["days"][str(self.cur)]["notes"].get(key, ""))
             ed.focus_set()
+
+    def set_editor_text(self, ed, text):
+        self.loading = True
+        ed.delete("1.0", "end")
+        ed.insert("1.0", text)
+        ed.edit_reset()
+        ed.edit_modified(False)
+        self.highlight(ed)
+        self.loading = False
 
     def copy_big(self):
         self.clipboard_clear()
@@ -884,6 +917,18 @@ class App(ctk.CTk):
         if not w.edit_modified():
             return
         w.edit_modified(False)
+        if key == "__note__":
+            if self.loading or self.cur_note is None:
+                return
+            n = self.note_by_id(self.cur_note)
+            if n is not None:
+                n["text"] = w.get("1.0", "end-1c")
+                n["updated"] = dt.datetime.now().isoformat(timespec="seconds")
+                self.mark_dirty(activity=False)
+                if key in self.hl_jobs:
+                    self.after_cancel(self.hl_jobs[key])
+                self.hl_jobs[key] = self.after(350, lambda: self.highlight(w))
+            return
         if self.loading or self.cur is None:
             return
         self.state_["days"][str(self.cur)]["notes"][key] = w.get("1.0", "end-1c")
@@ -1107,6 +1152,143 @@ class App(ctk.CTk):
             text=f"Total {total}/100   " + ("\u2713 you can move on" if ok else "below 80: revisit weak topics"),
             fg=OK if ok else ACC_HI)
 
+    # ---------- notes (books) ----------
+    def note_by_id(self, nid):
+        for n in self.state_.setdefault("notes", []):
+            if n["id"] == nid:
+                return n
+        return None
+
+    def build_notes(self):
+        f = self.pages["Notes"] = tk.Frame(self.main, bg=BG)
+        tl(f, "Notes", 26, TEXT, True).pack(fill="x")
+        tl(f, "Your notebooks. One book per topic, so nothing gets mixed.", 11, MUTED).pack(fill="x", pady=(0, 12))
+        body = tk.Frame(f, bg=BG)
+        body.pack(fill="both", expand=True)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        left = card(body, width=250)
+        left.grid(row=0, column=0, sticky="ns", padx=(0, 10))
+        left.pack_propagate(False)
+        gold_button(left, "\uff0b  New note", self.new_note, height=36).pack(fill="x", padx=12, pady=(12, 8))
+        self.note_list = FastScroll(left, PANEL)
+        self.note_list.pack(fill="both", expand=True, padx=(8, 4), pady=(0, 10))
+
+        right = card(body)
+        right.grid(row=0, column=1, sticky="nsew")
+        self.note_empty = tl(right, "No notes yet.\n\nPress  \uff0b New note  to start your first book.", 12, MUTED,
+                             False, PANEL, justify="center")
+        self.note_body = tk.Frame(right, bg=PANEL)
+        head = tk.Frame(self.note_body, bg=PANEL)
+        head.pack(fill="x", padx=16, pady=(14, 6))
+        self.note_title_var = tk.StringVar()
+        self.note_title_entry = tk.Entry(head, textvariable=self.note_title_var, bg=EDBG, fg=ACC_HI,
+                                         insertbackground=ACC, relief="flat", font=(UI_FONT, 14, "bold"),
+                                         highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACC)
+        self.note_title_entry.pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 10))
+        self.note_title_var.trace_add("write", self.on_note_title)
+        dark_button(head, "Delete", self.delete_note, width=70, height=30).pack(side="right")
+        dark_button(head, "Copy", self.copy_note, width=64, height=30).pack(side="right", padx=8)
+        dark_button(head, "\u2922 Expand", lambda: self.open_big("note"), width=84, height=30).pack(side="right")
+        host = tk.Frame(self.note_body, bg=EDBG)
+        host.pack(fill="both", expand=True, padx=14, pady=(2, 14))
+        ed = tk.Text(host, bg=EDBG, fg=TEXT, insertbackground=ACC, relief="flat", font=self.ef, undo=True,
+                     wrap="none", padx=14, pady=12, selectbackground=SEL, highlightthickness=0, bd=0)
+        ys = ctk.CTkScrollbar(host, command=ed.yview, button_color=BORDER, button_hover_color=ACC_DIM, width=12)
+        xs = ctk.CTkScrollbar(host, orientation="horizontal", command=ed.xview, button_color=BORDER,
+                              button_hover_color=ACC_DIM, height=12)
+        ed.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        ys.pack(side="right", fill="y")
+        xs.pack(side="bottom", fill="x")
+        ed.pack(fill="both", expand=True)
+        self.setup_editor(ed, lambda: "__note__")
+        self.note_ed = ed
+        self.show_note_body(False)
+
+    def show_note_body(self, has_note):
+        if has_note:
+            self.note_empty.pack_forget()
+            if not self.note_body.winfo_ismapped():
+                self.note_body.pack(fill="both", expand=True, padx=3, pady=3)
+        else:
+            self.note_body.pack_forget()
+            self.note_empty.pack(expand=True)
+
+    def refresh_note_list(self):
+        self.note_list.clear()
+        self.note_rows = {}
+        for n in self.state_.get("notes", []):
+            row = tk.Label(self.note_list.inner, text=f"\u25a4  {n['title']}", anchor="w", bg=PANEL, fg=TEXT,
+                           font=(UI_FONT, 11), padx=12, pady=9, cursor="hand2", bd=0,
+                           highlightthickness=1, highlightbackground=PANEL)
+            row.pack(fill="x", pady=2, padx=(0, 6))
+            row.bind("<Button-1>", lambda e, k=n["id"]: self.select_note(k))
+            self.note_rows[n["id"]] = row
+        self.style_note_rows()
+        self.show_note_body(bool(self.state_.get("notes")))
+
+    def style_note_rows(self):
+        for nid, row in self.note_rows.items():
+            sel = nid == self.cur_note
+            row.configure(bg=FIELD2 if sel else PANEL, fg=ACC_HI if sel else TEXT,
+                          highlightbackground=ACC if sel else PANEL)
+
+    def new_note(self):
+        notes = self.state_.setdefault("notes", [])
+        nid = max((n["id"] for n in notes), default=0) + 1
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        notes.append({"id": nid, "title": f"Note {len(notes) + 1}", "text": "", "created": now, "updated": now})
+        self.mark_dirty(activity=False)
+        self.refresh_note_list()
+        self.select_note(nid)
+        self.note_title_entry.focus_set()
+        self.note_title_entry.select_range(0, "end")
+
+    def select_note(self, nid):
+        n = self.note_by_id(nid)
+        if n is None:
+            return
+        self.cur_note = nid
+        self.show_note_body(True)
+        self.loading = True
+        self.note_title_var.set(n["title"])
+        self.loading = False
+        self.set_editor_text(self.note_ed, n["text"])
+        self.style_note_rows()
+
+    def on_note_title(self, *_):
+        if self.loading or self.cur_note is None:
+            return
+        n = self.note_by_id(self.cur_note)
+        if n is None:
+            return
+        n["title"] = self.note_title_var.get() or "Untitled"
+        row = self.note_rows.get(self.cur_note)
+        if row is not None:
+            row.configure(text=f"\u25a4  {n['title']}")
+        self.mark_dirty(activity=False)
+
+    def copy_note(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.note_ed.get("1.0", "end-1c"))
+        self.set_status("Copied to clipboard")
+
+    def delete_note(self):
+        n = self.note_by_id(self.cur_note) if self.cur_note is not None else None
+        if n is None:
+            return
+        if not messagebox.askyesno(APP, f"Delete \u201c{n['title']}\u201d? This cannot be undone."):
+            return
+        notes = self.state_["notes"]
+        i = notes.index(n)
+        notes.remove(n)
+        self.cur_note = None
+        self.mark_dirty(activity=False)
+        self.refresh_note_list()
+        if notes:
+            self.select_note(notes[min(i, len(notes) - 1)]["id"])
+
     # ---------- search ----------
     def build_search(self):
         f = self.pages["Search"] = tk.Frame(self.main, bg=BG)
@@ -1132,6 +1314,17 @@ class App(ctk.CTk):
         if len(q) < 2:
             return
         count = 0
+        for nb in self.state_.get("notes", []):
+            hay = nb["title"] + "\n" + nb["text"]
+            i = hay.lower().find(q)
+            if i >= 0:
+                snip = hay[max(0, i - 30): i + 70].replace("\n", " ")
+                row = tk.Label(self.res.inner, text=f"Notes \u00b7 {nb['title']}   \u2026{snip}\u2026", anchor="w",
+                               bg=PANEL, fg=ACC_HI, font=(UI_FONT, 10), padx=12, pady=8, cursor="hand2",
+                               highlightthickness=1, highlightbackground=BORDER)
+                row.pack(fill="x", pady=2, padx=(0, 6))
+                row.bind("<Button-1>", lambda e, k=nb["id"]: self.open_note_from_search(k))
+                count += 1
         for n in range(1, 91):
             d = self.state_["days"].get(str(n))
             if not d:
@@ -1155,6 +1348,10 @@ class App(ctk.CTk):
                 count += 1
                 if count >= 40:
                     return
+
+    def open_note_from_search(self, nid):
+        self.show_page("Notes")
+        self.select_note(nid)
 
     # ---------- timer ----------
     def build_timer(self):
